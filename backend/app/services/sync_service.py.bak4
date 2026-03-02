@@ -1,0 +1,413 @@
+"""
+Sync service for synchronizing PostgreSQL data to Neo4j graph.
+Ensures knowledge graph stays in sync with relational database.
+"""
+
+import logging
+from typing import Dict, List, Optional
+from sqlalchemy.orm import Session
+
+from app.models.event import Event
+from app.models.person import Person, Team
+from app.models.extraction import Decision, Task, Claim
+from app.models.topic import Topic
+from app.models.graph_schema import NodeType, RelationshipType
+from app.services.graph_service import GraphService
+
+logger = logging.getLogger(__name__)
+
+
+class SyncService:
+    """
+    Service for syncing PostgreSQL data to Neo4j knowledge graph.
+
+    Sync Strategy:
+    1. Persons and Teams are synced first (foundational entities)
+    2. Events, Decisions, Tasks, Claims synced next
+    3. Relationships created based on references
+    4. Topics and associations synced last
+    """
+
+    def __init__(self, db: Session):
+        self.db = db
+        self.graph = GraphService()
+
+    async def sync_person(self, person: Person) -> bool:
+        """
+        Sync a person to Neo4j.
+
+        Args:
+            person: Person model instance
+
+        Returns:
+            True if successful
+        """
+        try:
+            properties = {
+                "id": str(person.id),
+                "email": person.email,
+                "name": person.name or "",
+                "team_id": str(person.team_id) if person.team_id else None,
+                "first_seen": person.first_seen.isoformat() if person.first_seen else None,
+                "last_seen": person.last_seen.isoformat() if person.last_seen else None,
+                "event_count": person.event_count or 0,
+                "extra_data": person.extra_data if person.extra_data else None,
+            }
+
+            # Remove None values
+            properties = {k: v for k, v in properties.items() if v is not None}
+
+            self.graph.create_node(NodeType.PERSON, properties)
+
+            # Create MEMBER_OF relationship if team exists
+            if person.team_id:
+                self.graph.create_relationship(
+                    str(person.id),
+                    str(person.team_id),
+                    RelationshipType.MEMBER_OF
+                )
+
+            logger.info(f"Synced person: {person.email}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error syncing person {person.id}: {e}")
+            return False
+
+    async def sync_decision(self, decision: Decision) -> bool:
+        """
+        Sync a decision to Neo4j with versioning.
+
+        Args:
+            decision: Decision model instance
+
+        Returns:
+            True if successful
+        """
+        try:
+            properties = {
+                "id": str(decision.id),
+                "decision_key": decision.decision_key,
+                "title": decision.title,
+                "summary": decision.summary or "",
+                "rationale": decision.rationale or "",
+                "scope": decision.scope or "",
+                "status": decision.status.value if decision.status else "proposed",
+                "version": decision.version or "1.0",
+                "owner_id": str(decision.owner_id) if decision.owner_id else None,
+                "decided_by": decision.decided_by or [],
+                "affected_teams": decision.affected_teams or [],
+                "affected_projects": decision.affected_projects or [],
+                "confidence": decision.confidence or 0.5,
+                "evidence_event_ids": decision.evidence_event_ids or [],
+                "metadata": decision.extra_data if decision.extra_data else None,
+                "superseded_by_id": str(decision.superseded_by_id) if decision.superseded_by_id else None,
+            }
+
+            # Remove None values
+            properties = {k: v for k, v in properties.items() if v is not None}
+
+            self.graph.create_node(NodeType.DECISION, properties, version=decision.version)
+
+            # Create MADE_DECISION relationship if owner exists
+            if decision.owner_id:
+                self.graph.create_relationship(
+                    str(decision.owner_id),
+                    str(decision.id),
+                    RelationshipType.MADE_DECISION,
+                    {"timestamp": decision.created_at.isoformat() if decision.created_at else None}
+                )
+
+            # Create SUPPORTED_BY relationships to evidence events
+            for event_id in (decision.evidence_event_ids or []):
+                self.graph.create_relationship(
+                    str(decision.id),
+                    event_id,
+                    RelationshipType.SUPPORTED_BY,
+                    {"confidence": decision.confidence}
+                )
+
+            logger.info(f"Synced decision: {decision.decision_key}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error syncing decision {decision.id}: {e}")
+            return False
+
+    async def sync_task(self, task: Task) -> bool:
+        """
+        Sync a task to Neo4j.
+
+        Args:
+            task: Task model instance
+
+        Returns:
+            True if successful
+        """
+        try:
+            properties = {
+                "id": str(task.id),
+                "title": task.title,
+                "description": task.description or "",
+                "status": task.status or "open",
+                "priority": task.priority or "normal",
+                "assignee_id": str(task.assignee_id) if task.assignee_id else None,
+                "created_by_id": str(task.created_by_id) if task.created_by_id else None,
+                "due_date": task.due_date.isoformat() if task.due_date else None,
+                "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                "confidence": task.confidence or 0.5,
+                "evidence_event_ids": task.evidence_event_ids or [],
+                "metadata": task.extra_data if task.extra_data else None,
+            }
+
+            # Remove None values
+            properties = {k: v for k, v in properties.items() if v is not None}
+
+            self.graph.create_node(NodeType.TASK, properties)
+
+            # Create ASSIGNED_TO relationship if assignee exists
+            if task.assignee_id:
+                self.graph.create_relationship(
+                    str(task.id),
+                    str(task.assignee_id),
+                    RelationshipType.ASSIGNED_TO
+                )
+
+            # Create CREATED_BY relationship if creator exists
+            if task.created_by_id:
+                self.graph.create_relationship(
+                    str(task.created_by_id),
+                    str(task.id),
+                    RelationshipType.CREATED_BY
+                )
+
+            logger.info(f"Synced task: {task.title}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error syncing task {task.id}: {e}")
+            return False
+
+    async def sync_claim(self, claim: Claim) -> bool:
+        """
+        Sync a claim to Neo4j.
+
+        Args:
+            claim: Claim model instance
+
+        Returns:
+            True if successful
+        """
+        try:
+            properties = {
+                "id": str(claim.id),
+                "claim_key": claim.claim_key,
+                "text": claim.text,
+                "polarity": claim.polarity or "",
+                "claimant_id": str(claim.claimant_id) if claim.claimant_id else None,
+                "topic_id": str(claim.topic_id) if claim.topic_id else None,
+                "confidence": claim.confidence or 0.5,
+                "evidence_event_ids": claim.evidence_event_ids or [],
+                "metadata": claim.extra_data if claim.extra_data else None,
+            }
+
+            # Remove None values
+            properties = {k: v for k, v in properties.items() if v is not None}
+
+            self.graph.create_node(NodeType.CLAIM, properties)
+
+            # Create MADE_CLAIM relationship if claimant exists
+            if claim.claimant_id:
+                self.graph.create_relationship(
+                    str(claim.claimant_id),
+                    str(claim.id),
+                    RelationshipType.MADE_CLAIM
+                )
+
+            # Create RELATES_TO relationship if topic exists
+            if claim.topic_id:
+                self.graph.create_relationship(
+                    str(claim.id),
+                    str(claim.topic_id),
+                    RelationshipType.RELATES_TO
+                )
+
+            logger.info(f"Synced claim: {claim.claim_key}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error syncing claim {claim.id}: {e}")
+            return False
+
+    async def sync_topic(self, topic: Topic) -> bool:
+        """
+        Sync a topic to Neo4j.
+
+        Args:
+            topic: Topic model instance
+
+        Returns:
+            True if successful
+        """
+        try:
+            properties = {
+                "id": str(topic.id),
+                "name": topic.name,
+                "description": topic.description or "",
+                "keywords": topic.keywords or [],
+                "parent_id": str(topic.parent_id) if topic.parent_id else None,
+                "mention_count": topic.mention_count or 0,
+                "last_mentioned": topic.last_mentioned.isoformat() if topic.last_mentioned else None,
+                "metadata": topic.extra_data if topic.extra_data else None,
+            }
+
+            # Remove None values
+            properties = {k: v for k, v in properties.items() if v is not None}
+
+            self.graph.create_node(NodeType.TOPIC, properties)
+
+            # Create SUBCATEGORY_OF relationship if parent exists
+            if topic.parent_id:
+                self.graph.create_relationship(
+                    str(topic.id),
+                    str(topic.parent_id),
+                    RelationshipType.SUBCATEGORY_OF
+                )
+
+            logger.info(f"Synced topic: {topic.name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error syncing topic {topic.id}: {e}")
+            return False
+
+    async def sync_all_persons(self, limit: Optional[int] = None) -> Dict[str, int]:
+        """
+        Sync all persons from PostgreSQL to Neo4j.
+
+        Args:
+            limit: Optional limit on number of persons to sync
+
+        Returns:
+            Statistics dictionary
+        """
+        query = self.db.query(Person)
+        if limit:
+            query = query.limit(limit)
+
+        persons = query.all()
+
+        stats = {"total": len(persons), "success": 0, "failed": 0}
+
+        for person in persons:
+            if await self.sync_person(person):
+                stats["success"] += 1
+            else:
+                stats["failed"] += 1
+
+        logger.info(f"Synced persons: {stats}")
+        return stats
+
+    async def sync_all_decisions(self, limit: Optional[int] = None) -> Dict[str, int]:
+        """
+        Sync all decisions from PostgreSQL to Neo4j.
+
+        Args:
+            limit: Optional limit on number of decisions to sync
+
+        Returns:
+            Statistics dictionary
+        """
+        query = self.db.query(Decision)
+        if limit:
+            query = query.limit(limit)
+
+        decisions = query.all()
+
+        stats = {"total": len(decisions), "success": 0, "failed": 0}
+
+        for decision in decisions:
+            if await self.sync_decision(decision):
+                stats["success"] += 1
+            else:
+                stats["failed"] += 1
+
+        logger.info(f"Synced decisions: {stats}")
+        return stats
+
+    async def sync_all_tasks(self, limit: Optional[int] = None) -> Dict[str, int]:
+        """Sync all tasks from PostgreSQL to Neo4j."""
+        query = self.db.query(Task)
+        if limit:
+            query = query.limit(limit)
+
+        tasks = query.all()
+        stats = {"total": len(tasks), "success": 0, "failed": 0}
+
+        for task in tasks:
+            if await self.sync_task(task):
+                stats["success"] += 1
+            else:
+                stats["failed"] += 1
+
+        logger.info(f"Synced tasks: {stats}")
+        return stats
+
+    async def sync_all_claims(self, limit: Optional[int] = None) -> Dict[str, int]:
+        """Sync all claims from PostgreSQL to Neo4j."""
+        query = self.db.query(Claim)
+        if limit:
+            query = query.limit(limit)
+
+        claims = query.all()
+        stats = {"total": len(claims), "success": 0, "failed": 0}
+
+        for claim in claims:
+            if await self.sync_claim(claim):
+                stats["success"] += 1
+            else:
+                stats["failed"] += 1
+
+        logger.info(f"Synced claims: {stats}")
+        return stats
+
+    async def sync_all_topics(self, limit: Optional[int] = None) -> Dict[str, int]:
+        """Sync all topics from PostgreSQL to Neo4j."""
+        query = self.db.query(Topic)
+        if limit:
+            query = query.limit(limit)
+
+        topics = query.all()
+        stats = {"total": len(topics), "success": 0, "failed": 0}
+
+        for topic in topics:
+            if await self.sync_topic(topic):
+                stats["success"] += 1
+            else:
+                stats["failed"] += 1
+
+        logger.info(f"Synced topics: {stats}")
+        return stats
+
+    async def full_sync(self, limit_per_type: Optional[int] = None) -> Dict[str, Dict]:
+        """
+        Perform full sync of all entities from PostgreSQL to Neo4j.
+
+        Args:
+            limit_per_type: Optional limit per entity type
+
+        Returns:
+            Comprehensive statistics
+        """
+        logger.info("Starting full sync to Neo4j")
+
+        results = {
+            "persons": await self.sync_all_persons(limit_per_type),
+            "topics": await self.sync_all_topics(limit_per_type),
+            "decisions": await self.sync_all_decisions(limit_per_type),
+            "tasks": await self.sync_all_tasks(limit_per_type),
+            "claims": await self.sync_all_claims(limit_per_type),
+        }
+
+        logger.info(f"Full sync complete: {results}")
+        return results

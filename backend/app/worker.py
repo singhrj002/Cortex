@@ -1,0 +1,395 @@
+"""
+Celery worker configuration and tasks.
+Handles async processing of events, extractions, and other background tasks.
+"""
+
+import logging
+from celery import Celery
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.db.session import SessionLocal
+from app.services.extraction_service import ExtractionService
+from app.graphs.extraction_graph import create_extraction_workflow
+from app.services.notification_service import NotificationService
+from app.core.websocket import websocket_manager
+
+logger = logging.getLogger(__name__)
+
+# Create Celery app
+celery_app = Celery(
+    "ai_chief_of_staff",
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND
+)
+
+# Configure Celery
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+    task_track_started=True,
+    task_time_limit=30 * 60,  # 30 minutes
+    task_soft_time_limit=25 * 60,  # 25 minutes
+    worker_prefetch_multiplier=1,  # Process one task at a time for better control
+)
+
+
+def get_db() -> Session:
+    """Get database session for Celery tasks."""
+    return SessionLocal()
+
+
+def _save_extractions_to_db(db: Session, event, extractions: dict) -> dict:
+    """
+    Save extracted entities to the database.
+
+    Args:
+        db: Database session
+        event: Event model instance
+        extractions: Dictionary with decisions, tasks, claims from workflow
+
+    Returns:
+        Dictionary with counts of saved entities
+    """
+    from app.models.extraction import Decision, Task, Claim, ExtractionStatus
+    from app.models.person import Person
+    from datetime import datetime
+
+    counts = {"decisions": 0, "tasks": 0, "claims": 0}
+
+    # Save decisions
+    for decision_data in extractions.get("decisions", []):
+        try:
+            # Normalize decision_key
+            decision_key = decision_data.get("decision_key_hint", decision_data.get("title", "unknown"))
+            decision_key = decision_key.lower().replace(" ", "_")[:100]
+
+            # Find owner
+            owner = None
+            if decision_data.get("owner_email"):
+                owner = db.query(Person).filter(Person.email == decision_data["owner_email"]).first()
+
+            decision = Decision(
+                decision_key=decision_key,
+                title=decision_data.get("title", ""),
+                summary=decision_data.get("summary"),
+                rationale=decision_data.get("rationale"),
+                scope=decision_data.get("scope"),
+                status=ExtractionStatus.PROPOSED,
+                version="1.0",
+                owner_id=owner.id if owner else None,
+                decided_by=decision_data.get("decided_by_emails", []),
+                confidence=decision_data.get("confidence", 0.5),
+                evidence_event_ids=[str(event.id)],
+                extra_data={"evidence": decision_data.get("evidence")}
+            )
+            db.add(decision)
+            db.flush()
+            counts["decisions"] += 1
+            logger.info(f"Saved decision: {decision.title}")
+        except Exception as e:
+            logger.error(f"Error saving decision: {e}")
+
+    # Save tasks
+    for task_data in extractions.get("tasks", []):
+        try:
+            # Find assignee
+            assignee = None
+            if task_data.get("assignee_email"):
+                assignee = db.query(Person).filter(Person.email == task_data["assignee_email"]).first()
+
+            # Parse due_date
+            due_date = None
+            if task_data.get("due_date"):
+                try:
+                    due_date = datetime.fromisoformat(task_data["due_date"].replace("Z", "+00:00"))
+                except Exception:
+                    pass
+
+            task = Task(
+                title=task_data.get("title", ""),
+                description=task_data.get("description"),
+                assignee_id=assignee.id if assignee else None,
+                status="open",
+                priority=task_data.get("priority", "normal"),
+                due_date=due_date,
+                confidence=task_data.get("confidence", 0.5),
+                evidence_event_ids=[str(event.id)],
+                extra_data={"evidence": task_data.get("evidence")}
+            )
+            db.add(task)
+            db.flush()
+            counts["tasks"] += 1
+            logger.info(f"Saved task: {task.title}")
+        except Exception as e:
+            logger.error(f"Error saving task: {e}")
+
+    # Save claims
+    for claim_data in extractions.get("claims", []):
+        try:
+            # Normalize claim_key
+            claim_text = claim_data.get("text", "")
+            claim_key = claim_text[:50].lower().replace(" ", "_")
+
+            # Find claimant
+            claimant = None
+            if claim_data.get("claimant_email"):
+                claimant = db.query(Person).filter(Person.email == claim_data["claimant_email"]).first()
+
+            claim = Claim(
+                claim_key=claim_key,
+                text=claim_text,
+                polarity=claim_data.get("polarity", "neutral"),
+                claimant_id=claimant.id if claimant else None,
+                confidence=claim_data.get("confidence", 0.5),
+                evidence_event_ids=[str(event.id)],
+                extra_data={"evidence": claim_data.get("evidence")}
+            )
+            db.add(claim)
+            db.flush()
+            counts["claims"] += 1
+            logger.info(f"Saved claim: {claim.text[:50]}...")
+        except Exception as e:
+            logger.error(f"Error saving claim: {e}")
+
+    # Commit all changes
+    db.commit()
+    return counts
+
+
+@celery_app.task(name="process_event_extraction", bind=True)
+def process_event_extraction(self, event_id: str):
+    """
+    Process extraction for a single event.
+
+    Args:
+        event_id: UUID of the event to process
+
+    Returns:
+        Extraction result dictionary
+    """
+    logger.info(f"Starting extraction for event: {event_id}")
+
+    db = get_db()
+    try:
+        extraction_service = ExtractionService(db)
+
+        # Run extraction (using sync instead of async for Celery compatibility)
+        import asyncio
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(
+            extraction_service.extract_from_event(event_id)
+        )
+
+        logger.info(f"Extraction complete for event {event_id}: {result}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in extraction task for event {event_id}: {e}")
+        raise self.retry(exc=e, countdown=60, max_retries=3)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="batch_process_events", bind=True)
+def batch_process_events(self, event_ids: list):
+    """
+    Process extraction for multiple events in batch.
+
+    Args:
+        event_ids: List of event UUIDs to process
+
+    Returns:
+        Batch extraction result dictionary
+    """
+    logger.info(f"Starting batch extraction for {len(event_ids)} events")
+
+    db = get_db()
+    try:
+        extraction_service = ExtractionService(db)
+
+        # Run batch extraction
+        import asyncio
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(
+            extraction_service.batch_extract(event_ids)
+        )
+
+        logger.info(f"Batch extraction complete: {result}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in batch extraction task: {e}")
+        raise self.retry(exc=e, countdown=120, max_retries=2)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="process_pending_events")
+def process_pending_events(limit: int = 100):
+    """
+    Process all pending events (extraction_status='pending').
+
+    Args:
+        limit: Maximum number of events to process
+
+    Returns:
+        Number of events processed
+    """
+    from app.models.event import Event
+
+    logger.info(f"Processing pending events (limit={limit})")
+
+    db = get_db()
+    try:
+        # Find pending events
+        pending_events = db.query(Event).filter(
+            Event.extraction_status == "pending"
+        ).limit(limit).all()
+
+        event_ids = [str(event.id) for event in pending_events]
+
+        if not event_ids:
+            logger.info("No pending events found")
+            return {"processed": 0}
+
+        # Trigger batch extraction
+        result = batch_process_events.delay(event_ids)
+
+        logger.info(f"Triggered extraction for {len(event_ids)} events")
+        return {"processed": len(event_ids), "task_id": result.id}
+
+    except Exception as e:
+        logger.error(f"Error processing pending events: {e}")
+        raise
+    finally:
+        db.close()
+
+
+@celery_app.task(name="process_event_with_workflow", bind=True)
+def process_event_with_workflow(self, event_id: str):
+    """
+    Process extraction using LangGraph multi-agent workflow.
+    Creates notifications and broadcasts via WebSocket.
+
+    Args:
+        event_id: UUID of the event to process
+
+    Returns:
+        Workflow result dictionary
+    """
+    logger.info(f"Starting LangGraph workflow for event: {event_id}")
+
+    db = get_db()
+    try:
+        from app.models.event import Event
+
+        # Load event
+        event = db.query(Event).filter(Event.id == event_id).first()
+        if not event:
+            raise ValueError(f"Event not found: {event_id}")
+
+        # Prepare event data
+        event_data = {
+            "sender": event.sender,
+            "recipients": event.recipients or [],
+            "subject": event.subject or "",
+            "timestamp": event.timestamp.isoformat() if event.timestamp else "",
+            "body": event.body_text or ""
+        }
+
+        # Create and run workflow
+        workflow = create_extraction_workflow(db)
+
+        import asyncio
+        loop = asyncio.get_event_loop()
+        final_state = loop.run_until_complete(
+            workflow.run(event_id=event_id, event_data=event_data)
+        )
+
+        # Extract results
+        extractions = final_state.get("extractions", {})
+        coordinator_routing = final_state.get("routing", {})
+        agent_summary = final_state.get("agent_outputs", {}).get("summarizer", {})
+
+        # Save extracted entities to database
+        saved_entities = _save_extractions_to_db(db, event, extractions)
+        logger.info(f"Saved {saved_entities['decisions']} decisions, {saved_entities['tasks']} tasks, {saved_entities['claims']} claims")
+
+        # Sync to Neo4j graph
+        try:
+            from app.services.sync_service import SyncService
+            sync_service = SyncService(db)
+            loop.run_until_complete(sync_service.full_sync())
+            logger.info("Synced entities to Neo4j graph")
+        except Exception as e:
+            logger.warning(f"Failed to sync to Neo4j: {e}")
+
+        # Update event status
+        event.extraction_status = "completed"
+        db.commit()
+
+        # Create notifications
+        notification_service = NotificationService(db)
+        notifications = loop.run_until_complete(
+            notification_service.create_notifications_from_extraction(
+                event_id=event_id,
+                extractions=extractions,
+                coordinator_routing=coordinator_routing,
+                agent_summary=agent_summary
+            )
+        )
+
+        # Broadcast notifications via WebSocket
+        for notification in notifications:
+            loop.run_until_complete(
+                websocket_manager.broadcast_notification(
+                    notification_dict=notification.to_dict(),
+                    user_email=notification.recipient_email
+                )
+            )
+
+        # Mark notifications as delivered
+        for notification in notifications:
+            loop.run_until_complete(
+                notification_service.mark_as_delivered(notification.id)
+            )
+
+        logger.info(f"Workflow complete for event {event_id}: created {len(notifications)} notifications")
+
+        return {
+            "status": "success",
+            "processing_status": final_state.get("processing_status"),
+            "extractions": {
+                "decisions": len(extractions.get("decisions", [])),
+                "tasks": len(extractions.get("tasks", [])),
+                "claims": len(extractions.get("claims", [])),
+            },
+            "notifications_created": len(notifications),
+            "errors": final_state.get("errors", [])
+        }
+
+    except Exception as e:
+        logger.error(f"Error in workflow task for event {event_id}: {e}")
+        raise self.retry(exc=e, countdown=60, max_retries=3)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="health_check")
+def health_check():
+    """
+    Celery worker health check task.
+
+    Returns:
+        Status dictionary
+    """
+    return {"status": "healthy", "worker": "operational"}
+
+
+if __name__ == "__main__":
+    # Run worker
+    celery_app.start()
